@@ -92,6 +92,8 @@ still have the phase response of a causal equalizer.
 ## Implementation and checks
 
 FFmpeg decodes to 48 kHz stereo float32, preserving precision from 24-bit files.
+Builds with SoXR use it for resampling; essentials builds use FFmpeg's built-in
+resampler with a 64-tap filter. Decoder failures appear in JSON status and the log.
 The audio writer queues only the frames supplied, avoiding SoundCard 0.4.6's
 unwritten-buffer playback. The SoundCard version is pinned because that writer
 uses its Windows backend internals. Nonflat EQ uses streaming overlap-add

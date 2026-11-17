@@ -31,6 +31,7 @@ import threading
 import time
 import unicodedata
 from ctypes import wintypes
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
@@ -337,6 +338,17 @@ def scan(root: Path) -> list[Path]:
 NO_WINDOW = 0x08000000
 
 
+@lru_cache(maxsize=1)
+def resample_filter() -> str:
+    """Prefer SoXR, including support for FFmpeg's essentials builds."""
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-buildconf"],
+                            capture_output=True, timeout=10, creationflags=NO_WINDOW)
+    configuration = (result.stdout + result.stderr).decode("utf-8", "replace")
+    if "--enable-libsoxr" in configuration:
+        return f"aresample={RATE}:resampler=soxr"
+    return f"aresample={RATE}:resampler=swr:filter_size=64:phase_shift=10:exact_rational=1"
+
+
 def probe(path: Path) -> dict:
     try:
         out = subprocess.run(
@@ -386,12 +398,13 @@ class Track:
         self.done = False
         self.closed = False
         self.error = ""
+        resampler = resample_filter()
         # A file avoids blocking on a full stderr pipe while audio is read.
         self.error_file = tempfile.TemporaryFile()
         try:
             self.proc = subprocess.Popen(
                 ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0",
-                 "-vn", "-sn", "-ac", "2", "-af", f"aresample={RATE}:resampler=soxr",
+                 "-vn", "-sn", "-ac", "2", "-af", resampler,
                  "-f", "f32le", "-"],
                 stdout=subprocess.PIPE, stderr=self.error_file, stdin=subprocess.DEVNULL,
                 creationflags=NO_WINDOW)
@@ -1189,6 +1202,8 @@ class App:
             if self.track is None:
                 raise ValueError("nothing to play")
             want = (not e.playing) if name == "toggle" else name == "play"
+            if want and self.track.done and self.track.decoded == 0:
+                raise ValueError(self.track.error or "the track could not be decoded")
             if want and self.track.done and e.pos >= self.track.decoded:
                 e.seek(0)
             with e.lock:
