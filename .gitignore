@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+python-path.txt
+t3music.port
+t3music.lock
+t3music.log
+t3music.state.json
+playlists/
+*.tmp
+*.zip

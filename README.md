@@ -1,0 +1,119 @@
+# T3 Code Music Theme!
+
+A monochrome music player inside T3 Code's thread details card, with a live
+31-band spectrum, playback controls, and an agent-native /music skill.
+
+- The player works in the sidebar and floating details card, in light and dark mode.
+- Agents can build, reorder, search, shuffle, and save playlists.
+- A ten-band equalizer changes the audio and spectrum, with presets and per-band gains.
+
+Playlist and equalizer controls stay out of the T3 interface. The bundled skill
+is also published separately at
+[t3-code-music-skill](https://github.com/RAKiQWQ/t3-code-music-skill).
+
+## Install on Windows
+
+Requires T3 Code with theme customization, Python 3.10 or newer, and FFmpeg
+(both ffmpeg and ffprobe on PATH). Audio uses the default Windows WASAPI device.
+
+From a downloaded release or this checkout, run in PowerShell:
+
+    python -m pip install -r requirements.txt
+    .\install.ps1 -Python python
+    & "$env:USERPROFILE\.t3\tools\t3-music\music.ps1" start
+
+Pass an absolute interpreter path to -Python if you have several Python installs.
+The installer records it, so later PATH changes do not select another interpreter.
+Select **T3 Code Music Theme!** in T3 Code's theme picker. Its theme ID is
+mono-player, retained for existing installations.
+
+The installer places /music in the Codex and Claude skill folders, including
+CODEX_HOME when set. Start a new agent session to discover a newly installed
+skill. Use -SkipSkills to install only the player, or -Destination to change
+the player directory.
+
+Upgrades stop the old player and retain its runtime state. Run start afterward;
+the saved queue, track, position, volume, repeat mode, and EQ return paused.
+
+## Use with an agent
+
+Examples:
+
+    /music
+    /music play
+    /music add D:\Music\Album to the playlist
+    /music save this playlist as Evening
+    /music play track 3
+    /music cut the 1 kHz band by 4 dB
+    /music use the bass preset
+
+A bare /music reads status. The agent can control playback even when another
+theme is selected.
+
+## Command line
+
+Use the installed music.ps1 launcher, or call t3music.py with its recorded
+Python interpreter. Put --json before the command for machine-readable output;
+failed commands return ok: false and a nonzero exit code.
+
+| Command | Result |
+| --- | --- |
+| start / stop | Start or exit the background player |
+| play / pause / toggle | Control playback |
+| next / prev | Change track; prev first restarts after three seconds |
+| seek 60 / seek 1:30 / seek 50% | Seek by seconds, time, or percentage |
+| vol 30 | Set volume from 0 to 100 |
+| open "D:\Music" | Replace the queue with a folder and play |
+| open "D:\Music\song.flac" | Play a file with its folder as the queue |
+| status | Read playback state |
+| playlist list [TEXT] | Inspect or search queue entries with 1-based indices |
+| playlist add PATH / remove N / move FROM TO / play N | Edit or select queue entries |
+| playlist clear / shuffle | Clear or shuffle the queue |
+| playlist repeat all / one / off | Loop all tracks, loop one, or stop at the end |
+| playlist save NAME / load NAME / saved / delete NAME | Manage named playlists |
+| eq presets / preset NAME | List or apply flat, bass, treble, or vocal |
+| eq set HZ DB / curve DB1 ... DB10 | Set one band or a full curve |
+| eq off / on / reset | Bypass, enable, or flatten EQ |
+
+For example:
+
+    & "$env:USERPROFILE\.t3\tools\t3-music\music.ps1" --json playlist list "Album"
+    & "$env:USERPROFILE\.t3\tools\t3-music\music.ps1" --json eq set 1k -4
+
+Adding tracks does not interrupt playback. Queue edits preserve the current
+track when possible. Loading a saved playlist selects its first track paused
+if the current track is absent. Saved playlists store paths, not audio copies.
+
+EQ bands: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz; each
+accepts -12 to +12 dB. Boosts include automatic gain compensation. Flat and
+disabled curves bypass processing. EQ adds no buffering delay; the filters
+still have the phase response of a causal equalizer.
+
+## Implementation and checks
+
+FFmpeg decodes to 48 kHz stereo float32, preserving precision from 24-bit files.
+The audio writer queues only the frames supplied, avoiding SoundCard 0.4.6's
+unwritten-buffer playback. The SoundCard version is pinned because that writer
+uses its Windows backend internals. Nonflat EQ uses streaming overlap-add
+convolution, and the spectrum follows the applied curve and volume.
+
+Theme CSS animates precomputed spectrum windows. The file refreshes about
+every four seconds, so switching threads can briefly move the display out of
+step. CSS draws the controls; a Windows helper recognizes clicks using screen
+pixels around the pointer, in memory. It supports T3 Code desktop windows.
+
+Run the focused regression checks:
+
+    python -m unittest -v
+
+The tests cover EQ response and continuity, queue editing and persistence,
+command errors, 24-bit decoding, theme limits, and the audio buffer regression.
+The decoder check needs FFmpeg; the suite skips it when FFmpeg is unavailable.
+Tests do not control the installed player.
+
+For an isolated process, T3_MUSIC_HOME sets the runtime directory,
+T3_MUSIC_USERDATA selects a separate T3 userdata directory, and
+T3_MUSIC_HEADLESS=1 disables the theme and mouse integration.
+
+MIT licensed. T3 Code, Python, FFmpeg, and the audio dependencies are installed
+separately.

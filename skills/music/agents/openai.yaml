@@ -1,0 +1,4 @@
+interface:
+  display_name: "Music"
+  short_description: "Control T3 music, playlists, and equalizer"
+  default_prompt: "Use $music to control playback, manage my playlist, or adjust the equalizer."
