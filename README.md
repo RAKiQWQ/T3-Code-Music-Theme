@@ -1,7 +1,9 @@
-# T3 Code Music Theme!
+This theme was developed entirely by Claude Fable 5.2 and GPT 6.1 Sol.
 
-A monochrome music player inside T3 Code's thread details card, with a live
-31-band spectrum, playback controls, and an agent-native /music skill.
+# T3 Code Music Theme
+
+T3 Music is a monochrome music player inside T3 Code's thread details card,
+with a live 31-band spectrum, playback controls, and an agent-native /music skill.
 
 - The player works in the sidebar and floating details card, in light and dark mode.
 - Agents can build, reorder, search, shuffle, and save playlists.
@@ -24,7 +26,7 @@ From a downloaded release or this checkout, run in PowerShell:
 
 Pass an absolute interpreter path to -Python if you have several Python installs.
 The installer records it, so later PATH changes do not select another interpreter.
-Select **T3 Code Music Theme!** in T3 Code's theme picker. Its theme ID is
+Select **T3 Music** in T3 Code's theme picker. Its theme ID is
 mono-player, retained for existing installations.
 
 The installer places /music in the Codex and Claude skill folders, including
@@ -86,8 +88,9 @@ if the current track is absent. Saved playlists store paths, not audio copies.
 
 EQ bands: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz; each
 accepts -12 to +12 dB. Boosts include automatic gain compensation. Flat and
-disabled curves bypass processing. EQ adds no buffering delay; the filters
-still have the phase response of a causal equalizer.
+disabled curves bypass processing. EQ updates apply to newly processed blocks,
+each covering up to 80 ms of audio. The filters have the phase response of a
+causal equalizer.
 
 ## Implementation and checks
 
@@ -97,12 +100,17 @@ resampler with a 64-tap filter. Decoder failures appear in JSON status and the l
 The audio writer queues only the frames supplied, avoiding SoundCard 0.4.6's
 unwritten-buffer playback. The SoundCard version is pinned because that writer
 uses its Windows backend internals. Nonflat EQ uses streaming overlap-add
-convolution, and the spectrum follows the applied curve and volume.
+convolution in 80 ms blocks with single-precision transforms, while the device
+still receives 20 ms chunks. The spectrum follows the applied curve and volume.
+The writer waits for enough buffer space to send a chunk, and the audio thread
+waits for commands while paused.
 
 Theme CSS animates precomputed spectrum windows. The file refreshes about
 every four seconds, so switching threads can briefly move the display out of
-step. CSS draws the controls; a Windows helper recognizes clicks using screen
-pixels around the pointer, in memory. It supports T3 Code desktop windows.
+step. Spectrum computation and theme writes stop while all T3 Code windows
+are minimized, hidden, or on another virtual desktop, and resynchronize when
+a window returns. CSS draws the controls; a Windows helper recognizes clicks
+using screen pixels around the pointer, in memory. It supports T3 Code desktop windows.
 
 Run the focused regression checks:
 

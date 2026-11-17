@@ -56,12 +56,13 @@ class EqualizerTests(unittest.TestCase):
 
     def test_uneven_blocks_match_full_convolution_and_reset_drops_tail(self):
         eq = m.Equalizer([5, 4, 2, 0, -2, 1, 1, 2, 4, 5])
-        signal = np.random.default_rng(7).normal(0, 0.1, (3398, 2)).astype(np.float32)
+        sizes = (m.EQ_BLOCK, m.EQ_BLOCK, 17, m.CHUNK, 1, 500)
+        signal = np.random.default_rng(7).normal(0, 0.1, (sum(sizes), 2)).astype(np.float32)
         taps = np.fft.irfft(eq.curve[:, 0], m.EQ_FFT)[:m.EQ_TAPS]
         expected = np.column_stack([np.convolve(signal[:, channel], taps)[:len(signal)]
                                     for channel in (0, 1)])
         parts, offset = [], 0
-        for size in (960, 960, 17, 960, 1, 500):
+        for size in sizes:
             parts.append(eq.process(signal[offset:offset + size]).copy())
             offset += size
         np.testing.assert_allclose(np.concatenate(parts), expected, atol=1e-7, rtol=1e-6)
@@ -246,6 +247,16 @@ class PlaylistTests(unittest.TestCase):
 
 
 class AudioAndThemeTests(unittest.TestCase):
+    def test_playhead_excludes_audio_waiting_in_the_eq_block(self):
+        engine = m.Engine(queue.Queue())
+        engine.set_track(FakeTrack(Path("tone.wav")), pos=m.EQ_BLOCK, playing=True)
+        engine.ready = np.zeros((m.EQ_BLOCK - m.CHUNK, 2), np.float32)
+        engine.pad = m.CHUNK // 2
+        self.assertEqual(engine.playhead(), m.CHUNK // 2)
+        engine.seek(m.RATE)
+        self.assertIsNone(engine.ready)
+        self.assertEqual(engine.playhead(), m.RATE)
+
     @unittest.skipUnless(os.name == "nt" and shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "Windows and FFmpeg required")
     def test_real_decoder_preserves_stereo_24_bit_samples(self):

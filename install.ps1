@@ -82,4 +82,4 @@ if (-not $SkipSkills) {
     Write-Output 'Installed /music for Codex and Claude.'
 }
 Write-Output "Installed player: $destinationPath"
-Write-Output "Select 'T3 Code Music Theme!' in T3 Code, then run: & '$destinationPath\music.ps1' start"
+Write-Output "Select 'T3 Music' in T3 Code, then run: & '$destinationPath\music.ps1' start"

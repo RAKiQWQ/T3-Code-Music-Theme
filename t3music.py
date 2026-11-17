@@ -1,6 +1,6 @@
 """T3 Music - a small music player whose interface lives inside T3 Code.
 
-The interface is drawn by a T3 Code theme (`mono-player`) at the top of the
+The interface is drawn by the T3 Music theme at the top of the
 thread details card, the card on the right that turns into a floating popover
 when the window gets narrow. This process does everything a theme cannot:
 
@@ -40,6 +40,7 @@ RUNTIME = Path(os.environ.get("T3_MUSIC_HOME", str(HERE))).expanduser()
 USERDATA = Path(os.environ.get("T3_MUSIC_USERDATA", str(Path.home() / ".t3" / "userdata")))
 HEADLESS = os.environ.get("T3_MUSIC_HEADLESS") == "1"
 THEME_ID = "mono-player"
+THEME_NAME = "T3 Music"
 THEME_FILE = USERDATA / "themes" / f"{THEME_ID}.json"
 SETTINGS = USERDATA / "settings.json"
 PORT_FILE = RUNTIME / "t3music.port"
@@ -58,7 +59,10 @@ BUFFER = 4800          # device buffer (100 ms): survives GIL hiccups
 EQ_BANDS = (31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
 EQ_RANGE = 12.0
 EQ_TAPS = 8192
-EQ_FFT = 16384         # >= CHUNK + EQ_TAPS - 1
+EQ_FFT = 16384         # >= EQ_BLOCK + EQ_TAPS - 1
+# Frames filtered per FFT. The transform costs the same for 20 ms as for 80 ms,
+# so filtering one device chunk at a time spent four times the CPU.
+EQ_BLOCK = 3840
 EQ_GRID = 65536
 EQ_PRESETS = {
     "flat": [0] * 10,
@@ -310,7 +314,7 @@ def dynamic_css(*, gen: int, title: str, sub: str, playing: bool, pos: float,
 
 def idle_css() -> str:
     return static_css() + dynamic_css(
-        gen=0, title="T3 Music", sub="Not running", playing=False, pos=0, dur=0)
+        gen=0, title=THEME_NAME, sub="Not running", playing=False, pos=0, dur=0)
 
 
 # ==========================================================================
@@ -387,13 +391,6 @@ class Track:
         self.np = np
         path = path.expanduser().resolve()
         self.path = path
-        meta = probe(path)
-        self.title = meta["title"]
-        self.sub = " — ".join(x for x in (meta["artist"], meta["album"]) if x) \
-            or path.parent.name
-        self.duration = meta["duration"]
-        # np.zeros is lazily committed, so a generous estimate costs nothing.
-        self.pcm = np.zeros((int((self.duration or 60) * RATE) + RATE, 2), np.float32)
         self.decoded = 0
         self.done = False
         self.closed = False
@@ -411,6 +408,14 @@ class Track:
         except OSError:
             self.error_file.close()
             raise
+        # ffmpeg is already decoding into its pipe while ffprobe reads the tags.
+        meta = probe(path)
+        self.title = meta["title"]
+        self.sub = " — ".join(x for x in (meta["artist"], meta["album"]) if x) \
+            or path.parent.name
+        self.duration = meta["duration"]
+        # np.zeros is lazily committed, so a generous estimate costs nothing.
+        self.pcm = np.zeros((int((self.duration or 60) * RATE) + RATE, 2), np.float32)
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -492,7 +497,8 @@ class Equalizer:
         self.headroom_db = 20 * math.log10(compensation)
         taps = np.fft.irfft(response)[:EQ_TAPS]
         taps[-512:] *= np.hanning(1024)[512:]
-        self.curve = (np.fft.rfft(taps, EQ_FFT) / compensation)[:, None]
+        # complex64 keeps the float32 audio in single precision through the FFTs.
+        self.curve = (np.fft.rfft(taps, EQ_FFT) / compensation)[:, None].astype(np.complex64)
 
     def reset(self):
         self.tail = None
@@ -525,10 +531,20 @@ def write_frames(out, data) -> None:
     import numpy as np
     from soundcard.mediafoundation import _ffi
     data = np.ascontiguousarray(data, np.float32)
+    stalled = -1
     while len(data):
-        n = min(out._render_available_frames(), len(data))
+        free = out._render_available_frames()
+        if free < len(data) and free != stalled:
+            # Sleep until the device has played enough to take the rest in one
+            # piece, instead of topping it up every millisecond. If that did
+            # not make room (a buffer smaller than the chunk), write what fits.
+            stalled = free
+            time.sleep(max(0.002, (len(data) - free) / RATE))
+            continue
+        stalled = -1
+        n = min(free, len(data))
         if n <= 0:
-            time.sleep(0.001)
+            time.sleep(0.005)
             continue
         raw = data[:n].tobytes()
         _ffi.memmove(out._render_buffer(n)[0], raw, len(raw))
@@ -549,6 +565,8 @@ class Engine(threading.Thread):
         self.gain = 1.0
         self.eq = Equalizer()
         self.pad = 0          # frames written but not yet heard
+        self.ready = None     # filtered frames not yet written
+        self.wake = threading.Event()   # ends the idle wait
         self.alive = True
         self._ended = None
 
@@ -556,7 +574,14 @@ class Engine(threading.Thread):
         with self.lock:
             self.track, self.pos, self.playing, self._ended = track, pos, playing, None
             self.pad = 0
+            self.ready = None
             self.eq.reset()
+        self.wake.set()
+
+    def set_playing(self, playing: bool):
+        with self.lock:
+            self.playing = playing
+        self.wake.set()
 
     def seek(self, pos: int):
         with self.lock:
@@ -564,7 +589,9 @@ class Engine(threading.Thread):
                 self.pos = max(0, min(pos, max(self.track.frames - 1, 0)))
                 self._ended = None
                 self.pad = 0
+                self.ready = None
                 self.eq.reset()
+        self.wake.set()
 
     def set_eq(self, gains, enabled: bool = True):
         # Build coefficients outside the audio lock; swap only a finished filter.
@@ -574,7 +601,8 @@ class Engine(threading.Thread):
 
     def playhead(self) -> int:
         with self.lock:
-            return max(0, self.pos - (self.pad if self.playing else 0))
+            queued = len(self.ready) if self.ready is not None else 0
+            return max(0, self.pos - queued - (self.pad if self.playing else 0))
 
     def run(self):
         import numpy as np
@@ -586,24 +614,34 @@ class Engine(threading.Thread):
                 with speaker.player(samplerate=RATE, channels=2, blocksize=BUFFER) as out:
                     checked = time.monotonic()
                     while self.alive:
-                        chunk = None
+                        chunk, starved = None, False
                         with self.lock:
                             tr = self.track
                             if tr is not None and self.playing:
-                                n = min(CHUNK, tr.decoded - self.pos)
-                                if n > 0:
-                                    chunk = self.eq.process(tr.pcm[self.pos:self.pos + n])
-                                    chunk = chunk * np.float32(self.gain)
-                                    self.pos += n
-                                elif tr.done and self._ended is not tr:
-                                    self._ended = tr
-                                    self.events.put(("ended", tr))
+                                if self.ready is None or not len(self.ready):
+                                    block = EQ_BLOCK if self.eq.curve is not None else CHUNK
+                                    n = min(block, tr.decoded - self.pos)
+                                    if n > 0:
+                                        self.ready = self.eq.process(tr.pcm[self.pos:self.pos + n])
+                                        self.pos += n
+                                    elif not tr.done:
+                                        starved = True   # the decoder is behind
+                                    elif self._ended is not tr:
+                                        self._ended = tr
+                                        self.events.put(("ended", tr))
+                                if self.ready is not None and len(self.ready):
+                                    chunk = self.ready[:CHUNK] * np.float32(self.gain)
+                                    self.ready = self.ready[CHUNK:]
                         if chunk is not None:
                             write_frames(out, chunk)
                             self.pad = out.currentpadding
-                        else:
+                        elif starved:
                             self.pad = 0
                             time.sleep(0.01)
+                        else:       # paused or stopped: sleep until a command
+                            self.pad = 0
+                            self.wake.wait(0.25)
+                            self.wake.clear()
                         if time.monotonic() - checked > 3:   # follow device changes
                             checked = time.monotonic()
                             if sc.default_speaker().id != speaker.id:
@@ -750,6 +788,67 @@ def grab(x: int, y: int, w: int, h: int):
     return np.frombuffer(buf, np.uint8).reshape(h, w, 4)[:, :, 2::-1]
 
 
+_t3_pids: dict[int, bool] = {}
+
+
+def is_t3_pid(pid: int) -> bool:
+    if pid not in _t3_pids:
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        name = ""
+        h = k.OpenProcess(0x1000, False, pid)
+        if h:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                name = os.path.basename(buf.value).lower()
+            k.CloseHandle(h)
+        if len(_t3_pids) > 256:
+            _t3_pids.clear()
+        _t3_pids[pid] = name.startswith("t3 code")
+    return _t3_pids[pid]
+
+
+_ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def t3_window_showing() -> bool:
+    """Whether any T3 Code window is on screen: not minimized, hidden, or on
+    another virtual desktop. A window covered by others still counts."""
+    u = ctypes.windll.user32
+    u.IsWindowVisible.argtypes = u.IsIconic.argtypes = [wintypes.HWND]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    found = []
+
+    def visit(hwnd, _):
+        if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not is_t3_pid(pid.value):
+            return True
+        cloaked = wintypes.DWORD()
+        try:    # DWMWA_CLOAKED
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(hwnd), 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        except Exception:
+            pass
+        if cloaked.value:
+            return True
+        found.append(hwnd)
+        return False
+
+    try:
+        u.EnumWindows(_ENUM_PROC(visit), 0)
+    except Exception as exc:
+        log("window check failed:", repr(exc))
+        return True
+    return bool(found)
+
+
 class Mouse(threading.Thread):
     """Theme CSS can draw controls but cannot report clicks. So: when the left
     button goes down over a T3 Code window, take a screenshot of the area
@@ -761,17 +860,11 @@ class Mouse(threading.Thread):
         super().__init__(daemon=True)
         self.events = events
         self.u = ctypes.windll.user32
-        self.k = ctypes.windll.kernel32
         self.u.WindowFromPoint.argtypes = [POINT]
         self.u.WindowFromPoint.restype = wintypes.HWND
         self.u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
         self.u.GetAncestor.restype = wintypes.HWND
-        self.k.OpenProcess.restype = wintypes.HANDLE
-        self.k.QueryFullProcessImageNameW.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-        self.k.CloseHandle.argtypes = [wintypes.HANDLE]
         self.u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-        self.pids: dict[int, bool] = {}
 
     def over_t3(self, pt: POINT) -> bool:
         hwnd = self.u.WindowFromPoint(pt)
@@ -780,19 +873,7 @@ class Mouse(threading.Thread):
         root = self.u.GetAncestor(hwnd, 2) or hwnd
         pid = wintypes.DWORD()
         self.u.GetWindowThreadProcessId(root, ctypes.byref(pid))
-        if pid.value not in self.pids:
-            name = ""
-            h = self.k.OpenProcess(0x1000, False, pid.value)
-            if h:
-                buf = ctypes.create_unicode_buffer(1024)
-                size = wintypes.DWORD(1024)
-                if self.k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-                    name = os.path.basename(buf.value).lower()
-                self.k.CloseHandle(h)
-            if len(self.pids) > 256:
-                self.pids.clear()
-            self.pids[pid.value] = name.startswith("t3 code")
-        return self.pids[pid.value]
+        return is_t3_pid(pid.value)
 
     def locate(self, x: int, y: int):
         vx, vy = self.u.GetSystemMetrics(76), self.u.GetSystemMetrics(77)
@@ -854,6 +935,7 @@ class App:
         self.gen = 0
         self.running = True
         self.selected = False
+        self.showing = False   # theme selected and a T3 Code window on screen
         self.failures = 0
         self.template = None
         self.base_css = static_css()
@@ -1085,8 +1167,7 @@ class App:
         if ended and self.repeat == "one":
             delta = 0
         if self.repeat == "off" and not 0 <= self.index + delta < len(self.playlist):
-            with self.engine.lock:
-                self.engine.playing = False
+            self.engine.set_playing(False)
             return
         self.load(self.index + delta, play)
 
@@ -1105,6 +1186,7 @@ class App:
         if len(css) > 50000:
             log("css too long:", len(css))
             return
+        self.template["name"] = THEME_NAME
         self.template["css"] = css
         write_json(THEME_FILE, self.template)
 
@@ -1112,7 +1194,7 @@ class App:
         self.gen = self.gen % 9 + 1   # new animation names restart the animations
         tr = self.track
         if tr is None:
-            css = dynamic_css(gen=self.gen, title="T3 Music",
+            css = dynamic_css(gen=self.gen, title=THEME_NAME,
                               sub=f"No music in {self.root}", playing=False, pos=0, dur=0)
         else:
             playing = self.engine.playing
@@ -1206,8 +1288,7 @@ class App:
                 raise ValueError(self.track.error or "the track could not be decoded")
             if want and self.track.done and e.pos >= self.track.decoded:
                 e.seek(0)
-            with e.lock:
-                e.playing = want
+            e.set_playing(want)
         elif name == "next":
             self.step(+1)
         elif name == "prev":
@@ -1257,8 +1338,7 @@ class App:
                 return
             self.failures = self.failures + 1 if ev[1].decoded == 0 else 0
             if self.failures >= max(len(self.playlist), 1):   # nothing decodes
-                with self.engine.lock:
-                    self.engine.playing = False
+                self.engine.set_playing(False)
                 return True
             self.step(+1, play=True, ended=True)
         elif kind == "click":
@@ -1348,15 +1428,20 @@ class App:
                     except queue.Empty:
                         ev = None
                 now = time.monotonic()
-                if now - last_check > 2:
+                # Nobody sees the spectrum while every T3 Code window is
+                # minimized, so skip the analysis and the theme rewrite (which
+                # every window would re-parse). Look more often while hidden
+                # to be back quickly.
+                if now - last_check > (2 if self.showing else 0.5):
                     last_check = now
-                    selected = self.theme_selected()
-                    if selected and not self.selected:
+                    self.selected = self.theme_selected()
+                    showing = self.selected and t3_window_showing()
+                    if showing and not self.showing:
                         dirty = True
-                    self.selected = selected
+                    self.showing = showing
                 if self.engine.playing and now - last_write > REFRESH:
                     dirty = True
-                if dirty and self.selected and now - last_write > 0.15:
+                if dirty and self.showing and now - last_write > 0.15:
                     try:
                         self.render()
                     except Exception as exc:
@@ -1456,7 +1541,7 @@ def main(argv: list[str]):
     if sys.stdout is not None:   # pythonw has no console streams
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
-        description="T3 Code Music Theme! — Windows music player and agent controls",
+        description=f"{THEME_NAME} — Windows music player and agent controls",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Playback: start, stop, play, pause, toggle, next, prev, status
 Library:  open <file-or-folder>, seek <seconds|m:ss|percent%>, vol <0-100>
@@ -1538,7 +1623,7 @@ Playlist indices start at 1. Queue and EQ controls are available to agents only.
         print(f"   {res['position']} / {res['duration']}   track {res['track']}   "
               f"vol {res['volume']}   {res['library']}")
     if not res.get("theme_selected"):
-        print(f"note: the '{THEME_ID}' theme is not the selected T3 Code theme, "
+        print(f"note: the '{THEME_NAME}' theme is not the selected T3 Code theme, "
               "so the player is not visible")
     return 0 if res.get("ok") else 1
 

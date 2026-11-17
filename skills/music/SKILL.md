@@ -1,11 +1,11 @@
 ---
 name: music
-description: Control the Windows T3 Code Music Theme player when the user invokes /music or asks to play local music, manage its playlists, or adjust its equalizer.
+description: Control the T3 Music player in T3 Code on Windows when the user invokes /music or asks to play local music, manage its playlists, or adjust its equalizer.
 ---
 
-# Music
+# T3 Music
 
-Operate the installed T3 Code Music Theme player. The theme shows playback and
+Operate the installed T3 Music player. The theme shows playback and
 spectrum controls; playlist and EQ controls are available through the agent.
 A bare /music request means show status.
 
@@ -29,7 +29,7 @@ In Git Bash, resolve the same interpreter:
 
 For a custom installation, use the directory provided by the user. If the
 player is missing, direct setup requests to the
-[theme repository](https://github.com/RAKiQWQ/t3-code-music-theme).
+[theme repository](https://github.com/RAKiQWQ/T3-Code-Music-Theme).
 
 ## Operate
 
@@ -51,7 +51,7 @@ use playlist list TEXT to find matches in a large library without printing it al
 Do not adjust the library, queue, or volume beyond the musical request.
 
 If the user asks to show the interface, use t3_theme_read and then t3_theme_set
-to select mono-player. If it has not been published, pass the installed
+to select mono-player (T3 Music). If it has not been published, pass the installed
 mono-player.json as the theme. Playback works while another theme is selected.
 Do not edit T3 settings.json directly.
 
