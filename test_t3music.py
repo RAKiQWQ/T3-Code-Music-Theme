@@ -79,6 +79,7 @@ class FakeTrack:
         self.path = path
         self.title, self.sub = path.stem, path.parent.name
         self.done, self.closed = True, False
+        self.error = ""
         self.decoded = m.RATE * 2
         self.pcm = np.zeros((self.decoded, 2), np.float32)
 
@@ -93,7 +94,7 @@ class FakeTrack:
 class PlaylistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="t3-music-unit-")
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.paths = [self.root / name for name in ("2 & あ%.wav", "10.wav", "20.wav")]
         for path in self.paths:
             path.touch()
@@ -263,7 +264,7 @@ class AudioAndThemeTests(unittest.TestCase):
                 while not track.done and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertTrue(track.done)
-                self.assertEqual(track.decoded, len(samples))
+                self.assertEqual(track.decoded, len(samples), track.error)
                 np.testing.assert_allclose(track.pcm[:track.decoded], samples / 8388608,
                                            atol=1e-7, rtol=0)
             finally:

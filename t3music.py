@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -321,6 +322,7 @@ def natural_key(path: Path):
 
 
 def scan(root: Path) -> list[Path]:
+    root = root.expanduser().resolve()
     if root.is_file():
         return [root] if root.suffix.lower() in AUDIO_EXT else []
     found = []
@@ -371,6 +373,7 @@ class Track:
     def __init__(self, path: Path):
         import numpy as np
         self.np = np
+        path = path.expanduser().resolve()
         self.path = path
         meta = probe(path)
         self.title = meta["title"]
@@ -382,12 +385,19 @@ class Track:
         self.decoded = 0
         self.done = False
         self.closed = False
-        self.proc = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0",
-             "-vn", "-sn", "-ac", "2", "-af", f"aresample={RATE}:resampler=soxr",
-             "-f", "f32le", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-            creationflags=NO_WINDOW)
+        self.error = ""
+        # A file avoids blocking on a full stderr pipe while audio is read.
+        self.error_file = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0",
+                 "-vn", "-sn", "-ac", "2", "-af", f"aresample={RATE}:resampler=soxr",
+                 "-f", "f32le", "-"],
+                stdout=subprocess.PIPE, stderr=self.error_file, stdin=subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+        except OSError:
+            self.error_file.close()
+            raise
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -407,10 +417,17 @@ class Track:
                 self.decoded = end
         except Exception as exc:
             if not self.closed:
+                self.error = str(exc)
                 log("decode error:", self.path, exc)
         finally:
             self.proc.stdout.close()
-            self.proc.wait()
+            exit_code = self.proc.wait()
+            if exit_code and not self.closed:
+                self.error_file.seek(0)
+                self.error = self.error_file.read(8192).decode("utf-8", "replace").strip() \
+                    or f"ffmpeg exited with code {exit_code}"
+                log("decode error:", self.path, self.error)
+            self.error_file.close()
             self.done = True
 
     @property
@@ -838,7 +855,7 @@ class App:
 
     def restore_state(self, state: dict):
         root = state.get("root")
-        self.root = Path(root if isinstance(root, str) and root else DEFAULT_LIBRARY).expanduser()
+        self.root = Path(root if isinstance(root, str) and root else DEFAULT_LIBRARY).expanduser().resolve()
         try:
             volume = float(state.get("volume", 100))
             self.engine.gain = min(max(volume, 0), 100) / 100 if math.isfinite(volume) else 1
@@ -858,7 +875,7 @@ class App:
         else:           # migrate the original folder-based player state
             self.playlist = scan(self.root) if self.root.exists() else []
         if self.playlist:
-            saved = Path(state["path"]) if isinstance(state.get("path"), str) else None
+            saved = Path(state["path"]).expanduser().resolve() if isinstance(state.get("path"), str) else None
             index = self.playlist.index(saved) if saved in self.playlist else 0
             try:
                 position = max(0.0, float(state.get("position") or 0)) if saved in self.playlist else 0
@@ -1116,6 +1133,7 @@ class App:
             "track_index": self.index + 1 if tr else 0,
             "track_count": len(self.playlist),
             "path": str(tr.path) if tr else None,
+            "error": tr.error or None if tr else None,
             "position_seconds": round(self.engine.playhead() / RATE, 3) if tr else 0,
             "duration_seconds": round(tr.frames / RATE, 3) if tr else 0,
             "library": str(self.root),
