@@ -5,6 +5,10 @@ This theme was developed entirely by Claude Fable 5.2 and GPT 6.1 Sol.
 T3 Music is a monochrome music player inside T3 Code's thread details card,
 with a live 31-band spectrum, playback controls, and an agent-native /music skill.
 
+![T3 Music player with a live spectrum in T3 Code](docs/images/t3-music-preview.png)
+
+Live spectrum and playback controls in T3 Code's floating details card.
+
 - The player works in the sidebar and floating details card, in light and dark mode.
 - Agents can build, reorder, search, shuffle, and save playlists.
 - A ten-band equalizer changes the audio and spectrum, with presets and per-band gains.
