@@ -26,20 +26,34 @@ From a downloaded release or this checkout, run in PowerShell:
 
     python -m pip install -r requirements.txt
     .\install.ps1 -Python python
-    & "$env:USERPROFILE\.t3\tools\t3-music\music.ps1" start
 
 Pass an absolute interpreter path to -Python if you have several Python installs.
 The installer records it, so later PATH changes do not select another interpreter.
 Select **T3 Music** in T3 Code's theme picker. Its theme ID is
 mono-player, retained for existing installations.
 
+The card is drawn by the theme and worked by a background player; while the
+player is not running, clicks on the card do nothing. The installer therefore
+turns on autostart: a startup entry named T3 Music, for your Windows account
+only, runs a small watcher from sign-in, and the watcher starts the player,
+paused, each time T3 Code is started. Closing T3 Code leaves the player
+running. After stop it stays stopped until T3 Code is started again or you
+run start:
+
+    & "$env:USERPROFILE\.t3\tools\t3-music\music.ps1" start
+
+Switch autostart with autostart off and autostart on. Pass -NoAutostart to
+install without changing it, and run autostart off before deleting the player
+directory.
+
 The installer places /music in the Codex and Claude skill folders, including
 CODEX_HOME when set. Start a new agent session to discover a newly installed
 skill. Use -SkipSkills to install only the player, or -Destination to change
 the player directory.
 
-Upgrades stop the old player and retain its runtime state. Run start afterward;
-the saved queue, track, position, volume, repeat mode, and EQ return paused.
+Upgrades stop the old player and retain its runtime state. With autostart on
+and T3 Code open, the player returns within seconds; otherwise run start. The
+saved queue, track, position, volume, repeat mode, and EQ return paused.
 
 ## Use with an agent
 
@@ -65,6 +79,7 @@ failed commands return ok: false and a nonzero exit code.
 | Command | Result |
 | --- | --- |
 | start / stop | Start or exit the background player |
+| autostart on / off / status | Start the player with T3 Code, stop doing so, or report the setting |
 | play / pause / toggle | Control playback |
 | next / prev | Change track; prev first restarts after three seconds |
 | seek 60 / seek 1:30 / seek 50% | Seek by seconds, time, or percentage |
@@ -116,14 +131,22 @@ are minimized, hidden, or on another virtual desktop, and resynchronize when
 a window returns. CSS draws the controls; a Windows helper recognizes clicks
 using screen pixels around the pointer, in memory. It supports T3 Code desktop windows.
 
+At sign-out and shutdown, Windows gives no notice to a process that has
+neither a window nor a console, so the player keeps a hidden window to be
+told. It then saves its state and restores the idle card before it exits, as
+it does for stop. The autostart watcher is the same script in a mode that
+loads no audio code. Every two seconds it looks for a T3 Code process that
+shows a window, and it starts the player when a new one appears.
+
 Run the focused regression checks:
 
     python -m unittest -v
 
 The tests cover EQ response and continuity, queue editing and persistence,
-command errors, 24-bit decoding, theme limits, and the audio buffer regression.
+command errors, 24-bit decoding, theme limits, the audio buffer regression,
+autostart, and the exit at sign-out.
 The decoder check needs FFmpeg; the suite skips it when FFmpeg is unavailable.
-Tests do not control the installed player.
+Tests do not control the installed player or its startup entry.
 
 For an isolated process, T3_MUSIC_HOME sets the runtime directory,
 T3_MUSIC_USERDATA selects a separate T3 userdata directory, and

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -788,31 +789,62 @@ def grab(x: int, y: int, w: int, h: int):
     return np.frombuffer(buf, np.uint8).reshape(h, w, 4)[:, :, 2::-1]
 
 
+def exe_name(pid: int) -> str:
+    """Lower-case file name of a process's executable, "" if it cannot be read."""
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    name = ""
+    h = k.OpenProcess(0x1000, False, pid)
+    if h:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            name = os.path.basename(buf.value).lower()
+        k.CloseHandle(h)
+    return name
+
+
 _t3_pids: dict[int, bool] = {}
+_t3_pids_until = 0.0
 
 
 def is_t3_pid(pid: int) -> bool:
-    if pid not in _t3_pids:
-        k = ctypes.windll.kernel32
-        k.OpenProcess.restype = wintypes.HANDLE
-        k.QueryFullProcessImageNameW.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-        k.CloseHandle.argtypes = [wintypes.HANDLE]
-        name = ""
-        h = k.OpenProcess(0x1000, False, pid)
-        if h:
-            buf = ctypes.create_unicode_buffer(1024)
-            size = wintypes.DWORD(1024)
-            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-                name = os.path.basename(buf.value).lower()
-            k.CloseHandle(h)
-        if len(_t3_pids) > 256:
-            _t3_pids.clear()
-        _t3_pids[pid] = name.startswith("t3 code")
-    return _t3_pids[pid]
+    """Whether a process is T3 Code. Answers are kept for ten seconds only:
+    Windows hands process IDs out again, and an old "no" for the ID that T3
+    Code gets on its next start would hide its windows from the player."""
+    global _t3_pids_until
+    now = time.monotonic()
+    if now > _t3_pids_until:
+        _t3_pids.clear()
+        _t3_pids_until = now + 10
+    known = _t3_pids.get(pid)
+    if known is None:
+        known = _t3_pids[pid] = exe_name(pid).startswith("t3 code")
+    return known
 
 
 _ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def top_windows() -> list[tuple[int, int, bool]]:
+    """(handle, process ID, visible) of every top-level window. A minimized
+    window is visible in this sense; the hidden ones of helpers are not."""
+    u = ctypes.windll.user32
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    found = []
+
+    def visit(hwnd, _):
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        found.append((hwnd, pid.value, bool(u.IsWindowVisible(hwnd))))
+        return True
+
+    u.EnumWindows(_ENUM_PROC(visit), 0)
+    return found
 
 
 def t3_window_showing() -> bool:
@@ -919,6 +951,83 @@ class Mouse(threading.Thread):
 
 
 # ==========================================================================
+# Sign-out and shutdown
+# ==========================================================================
+
+SESSION_WINDOW = "T3MusicSession"   # window class of the player's hidden window
+WM_CLOSE, WM_ENDSESSION = 0x0010, 0x0016
+LRESULT = ctypes.c_ssize_t
+_WND_PROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                               wintypes.WPARAM, wintypes.LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _WND_PROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+
+class SessionEnd(threading.Thread):
+    """Windows ends a process that has no window at sign-out and shutdown
+    without telling it. The player then lost its last seconds of state and,
+    worse, left its card in the theme: after the next start the card looked
+    alive with nothing behind it. A top-level window is told first and the
+    session waits about five seconds for its answer, so this thread keeps a
+    hidden one and holds the answer back until the main loop has cleaned up."""
+
+    def __init__(self, app: App):
+        super().__init__(daemon=True)
+        self.app = app
+
+    def run(self):
+        try:
+            u = ctypes.WinDLL("user32", use_last_error=True)   # own prototypes
+            k = ctypes.WinDLL("kernel32")
+            u.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                         wintypes.WPARAM, wintypes.LPARAM]
+            u.DefWindowProcW.restype = LRESULT
+            u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+            u.CreateWindowExW.argtypes = [
+                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            u.CreateWindowExW.restype = wintypes.HWND
+            u.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                      wintypes.UINT, wintypes.UINT]
+            u.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            k.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            k.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def answer(hwnd, msg, wparam, lparam):
+                if msg == WM_ENDSESSION and wparam:
+                    # The session may end as soon as this returns.
+                    log("session ending")
+                    self.app.running = False
+                    self.app.stopped.wait(4)
+                    return 0
+                if msg == WM_CLOSE:     # e.g. taskkill without /F: a plain stop
+                    self.app.running = False
+                    return 0
+                # Agrees to WM_QUERYENDSESSION; WM_ENDSESSION follows.
+                return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            answer = _WND_PROC(answer)   # the window class points at it: keep it
+            module = k.GetModuleHandleW(None)
+            cls = WNDCLASSW(lpfnWndProc=answer, hInstance=module,
+                            lpszClassName=SESSION_WINDOW)
+            if not u.RegisterClassW(ctypes.byref(cls)) or not u.CreateWindowExW(
+                    0, SESSION_WINDOW, THEME_NAME, 0, 0, 0, 0, 0, None, None, module, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            log("session watch failed:", repr(exc))
+
+
+# ==========================================================================
 # The player
 # ==========================================================================
 
@@ -934,6 +1043,7 @@ class App:
         self.track: Track | None = None
         self.gen = 0
         self.running = True
+        self.stopped = threading.Event()   # set once run() has cleaned up
         self.selected = False
         self.showing = False   # theme selected and a T3 Code window on screen
         self.failures = 0
@@ -1413,6 +1523,7 @@ class App:
             self.restore_state(self.load_state())
             log(f"library: {self.root} ({len(self.playlist)} tracks)")
             self.engine.start()
+            SessionEnd(self).start()
             if not HEADLESS:
                 Mouse(self.events).start()
             dirty, last_write, last_check, last_save = True, 0.0, 0.0, time.monotonic()
@@ -1467,6 +1578,167 @@ class App:
                 log("final write failed:", repr(exc))
             PORT_FILE.unlink(missing_ok=True)
             log("stopped")
+            self.stopped.set()
+
+
+# ==========================================================================
+# Starting with T3 Code
+# ==========================================================================
+# The card is only a drawing: without the player behind it, a click does
+# nothing. `autostart on` has Windows run a small watcher at sign-in, which
+# starts the player whenever T3 Code is started.
+
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # of this user
+
+
+def t3_apps() -> set[int]:
+    """Process IDs of the T3 Code apps that have a window up; a minimized one
+    counts. T3 Code's helper processes and its `t3` command line run the same
+    executable, but none of them shows a window."""
+    pids = {pid for _hwnd, pid, visible in top_windows() if visible}
+    return {pid for pid in pids if exe_name(pid).startswith("t3 code")}
+
+
+def notice_t3(seen: set[int]) -> set[int]:
+    """One look for T3 Code: start the player if an app has appeared since
+    `seen`, the result of the previous look."""
+    apps = t3_apps()
+    if apps - seen:
+        log("watch: T3 Code started")
+        if not start_player():
+            log("watch: the player did not start")
+    return apps
+
+
+@lru_cache(maxsize=None)
+def _events():
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    k.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateEventW.restype = k.OpenEventW.restype = wintypes.HANDLE
+    k.SetEvent.argtypes = k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    return k
+
+
+def watch_name() -> str:
+    """Name of the Windows event a running watcher holds. Setting the event
+    stops the watcher. There is one per T3 Code userdata directory."""
+    key = os.path.normcase(os.path.abspath(USERDATA)).encode("utf-8")
+    return "Local\\T3Music-watch-" + hashlib.sha256(key).hexdigest()[:16]
+
+
+def watching() -> bool:
+    k = _events()
+    event = k.OpenEventW(0x00100000, False, watch_name())   # SYNCHRONIZE
+    if not event:
+        return ctypes.get_last_error() == 5     # there, but not ours to open
+    k.CloseHandle(event)
+    return True
+
+
+def stop_watching(timeout: float = 5.0) -> bool:
+    """Tell the watcher to stop. False if one is still running afterwards."""
+    k = _events()
+    event = k.OpenEventW(0x0002, False, watch_name())       # EVENT_MODIFY_STATE
+    if event:
+        k.SetEvent(event)
+        k.CloseHandle(event)
+    deadline = time.monotonic() + timeout
+    while watching():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def watch(poll: float = 2.0) -> None:
+    """The `watch` command: start the player whenever T3 Code is started.
+
+    It reacts to T3 Code apps it has not seen before. So a player that was
+    stopped stays stopped until T3 Code is started again, and closing T3 Code
+    leaves the player alone."""
+    k = _events()
+    deadline = time.monotonic() + 30
+    while True:
+        ctypes.set_last_error(0)
+        event = k.CreateEventW(None, True, False, watch_name())
+        error = ctypes.get_last_error()
+        if not event:
+            log("watch: could not start:", ctypes.WinError(error))
+            return
+        if error != 183:        # ERROR_ALREADY_EXISTS: another watcher's event
+            break
+        stopping = k.WaitForSingleObject(event, 0) == 0
+        k.CloseHandle(event)
+        if not stopping or time.monotonic() > deadline:
+            return              # that watcher stays at work
+        time.sleep(0.25)        # it was told to stop: take over once it has
+    log("watch: started, pid", os.getpid())
+    seen: set[int] = set()
+    try:
+        while True:
+            try:
+                seen = notice_t3(seen)
+            except Exception as exc:
+                log("watch error:", repr(exc))
+            if k.WaitForSingleObject(event, int(poll * 1000)) != 0x102:   # not a timeout
+                break
+    finally:
+        k.CloseHandle(event)
+        log("watch: stopped")
+
+
+def autostart_command() -> str | None:
+    """The command Windows runs for this player at sign-in, if any."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            return str(winreg.QueryValueEx(key, THEME_NAME)[0])
+    except FileNotFoundError:
+        return None
+
+
+def autostart(action: str = "status") -> dict:
+    """The `autostart` command. "on" has Windows run the watcher at sign-in
+    and (re)starts it now, so it runs this file's code; "off" undoes both."""
+    import winreg
+    if action == "on":
+        python = Path(sys.executable).with_name("pythonw.exe")
+        if not python.exists():     # python.exe would open a console at sign-in
+            raise ValueError(f"autostart needs pythonw.exe next to {sys.executable}")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, THEME_NAME, 0, winreg.REG_SZ,
+                              f'"{python}" "{Path(__file__).resolve()}" watch')
+        stop_watching()
+        spawn("watch")
+        deadline = time.monotonic() + 10
+        while not watching() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    elif action == "off":
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, THEME_NAME)
+        except FileNotFoundError:
+            pass
+        stop_watching()
+    elif action != "status":
+        raise ValueError("usage: autostart [on|off|status]")
+    command, running = autostart_command(), watching()
+    if command and running:
+        message = "autostart is on: the player starts with T3 Code"
+    elif command:
+        message = "autostart is on, but its watcher is not running; autostart on restarts it"
+    elif running:
+        message = "autostart is off, but its watcher is still running"
+    else:
+        message = "autostart is off"
+    wanted = {"on": True, "off": False}.get(action)
+    return {"ok": wanted is None or (bool(command) == wanted and running == wanted),
+            "message": message, "autostart": command is not None,
+            "watching": running, "command": command}
 
 
 # ==========================================================================
@@ -1486,6 +1758,29 @@ def send(request: str | dict, timeout: float = 25.0):
             return json.loads(data.decode("utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def spawn(command: str) -> None:
+    """Run one of this file's commands in the background, without a console."""
+    exe = Path(sys.executable).with_name("pythonw.exe")
+    launch = [str(exe if exe.exists() else sys.executable), str(Path(__file__)), command]
+    flags = 0x00000008 | 0x00000200   # detached, own process group
+    try:    # also leave the job of the shell that started us, if allowed
+        subprocess.Popen(launch, cwd=str(HERE), creationflags=flags | 0x01000000)
+    except OSError:
+        subprocess.Popen(launch, cwd=str(HERE), creationflags=flags)
+
+
+def start_player() -> bool:
+    """Start the background player unless it is running. False if it did not come up."""
+    if send("ping") is not None:
+        return True
+    spawn("run")
+    for _ in range(60):
+        time.sleep(0.25)
+        if send("ping") is not None:
+            return True
+    return False
 
 
 def daemon():
@@ -1544,6 +1839,7 @@ def main(argv: list[str]):
         description=f"{THEME_NAME} — Windows music player and agent controls",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Playback: start, stop, play, pause, toggle, next, prev, status
+Startup:  autostart [on|off|status] - start the player whenever T3 Code starts
 Library:  open <file-or-folder>, seek <seconds|m:ss|percent%>, vol <0-100>
 Playlist: playlist [list|add PATH|remove N|move FROM TO|clear|play N|shuffle]
           playlist repeat <all|one|off>, saved, save NAME, load NAME, delete NAME
@@ -1557,32 +1853,31 @@ Playlist indices start at 1. Queue and EQ controls are available to agents only.
     options = parser.parse_args(argv)
     cmd = options.command.lower()
     args = options.args
-    if cmd in ("start", "run") and os.name != "nt":
+    if cmd in ("start", "run", "watch", "autostart") and os.name != "nt":
         print(json.dumps({"ok": False, "message": "audio playback requires Windows"})
               if options.json else "audio playback requires Windows")
         return 1
     if cmd == "run":
         return daemon()
+    if cmd == "watch":    # what `autostart on` has Windows run at sign-in
+        return watch()
+    if cmd == "autostart":
+        try:
+            if len(args) > 1:
+                raise ValueError("usage: autostart [on|off|status]")
+            res = autostart(args[0].lower() if args else "status")
+        except (OSError, ValueError) as exc:
+            res = {"ok": False, "message": str(exc)}
+        print(json.dumps(res, ensure_ascii=False) if options.json else res["message"])
+        return 0 if res["ok"] else 1
     if cmd == "css":      # print the idle stylesheet (used to publish the theme)
         print(idle_css())
         return
     if cmd == "start":
-        if send("ping") is None:
-            exe = Path(sys.executable).with_name("pythonw.exe")
-            launch = [str(exe if exe.exists() else sys.executable), str(Path(__file__)), "run"]
-            flags = 0x00000008 | 0x00000200   # detached, own process group
-            try:    # also leave the job of the shell that started us, if allowed
-                subprocess.Popen(launch, cwd=str(HERE), creationflags=flags | 0x01000000)
-            except OSError:
-                subprocess.Popen(launch, cwd=str(HERE), creationflags=flags)
-            for _ in range(60):
-                time.sleep(0.25)
-                if send("ping") is not None:
-                    break
-            else:
-                error = {"ok": False, "message": f"player did not start, see {LOG_FILE}"}
-                print(json.dumps(error) if options.json else error["message"])
-                return 1
+        if not start_player():
+            error = {"ok": False, "message": f"player did not start, see {LOG_FILE}"}
+            print(json.dumps(error) if options.json else error["message"])
+            return 1
         cmd = "status"
     try:
         if cmd == "open":

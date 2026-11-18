@@ -39,7 +39,14 @@ retry the requested command once. Start restores the queue, position, volume,
 and EQ with playback paused; issue play only when requested. Stop exits the
 background process; pause retains it.
 
-Read [commands.md](references/commands.md) for playlist or EQ operations.
+The card in T3 Code responds to clicks only while the player runs. If the user
+reports a card that does nothing, read status, start the player if it is
+stopped, and read autostart status. With autostart on, which the installer
+sets, the player starts paused whenever T3 Code is started; after stop it
+stays stopped until start or the next start of T3 Code. Change autostart only
+when asked.
+
+Read [commands.md](references/commands.md) for playlist, EQ, or autostart operations.
 Ordinary commands are play, pause, toggle, next, prev, seek, vol, open, and status.
 Seek accepts seconds, m:ss, or a percentage. Prev restarts a track after three
 seconds; another prev moves to the previous track.

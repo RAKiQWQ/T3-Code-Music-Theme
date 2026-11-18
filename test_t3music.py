@@ -1,4 +1,5 @@
 """Focused regressions; no commands are sent to the installed player."""
+import ctypes
 import json
 import math
 import os
@@ -7,9 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import wave
+from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import patch
 
@@ -320,16 +323,179 @@ class AudioAndThemeTests(unittest.TestCase):
         self.assertNotIn("url(test)", css)
 
 
+class AutostartTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="t3-music-auto-")
+        self.root = Path(self.temp.name).resolve()
+        self.patches = [
+            patch.object(m, "LOG_FILE", self.root / "check.log"),
+            # Its own userdata directory keeps this watcher apart from a real one.
+            patch.object(m, "USERDATA", self.root / "userdata"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def test_only_t3_code_with_a_window_counts_as_the_app(self):
+        names = {100: "t3 code (beta).exe", 200: "t3 code (beta).exe",
+                 300: "explorer.exe", 400: ""}
+        windows = [(1, 100, True), (2, 100, False),
+                   (3, 200, False),     # a helper or the t3 command: same program
+                   (4, 300, True), (5, 400, True)]
+        with patch.object(m, "top_windows", return_value=windows), \
+                patch.object(m, "exe_name", side_effect=names.get):
+            self.assertEqual(m.t3_apps(), {100})
+
+    def test_player_starts_once_for_each_start_of_t3_code(self):
+        with patch.object(m, "t3_apps", return_value=set()) as apps, \
+                patch.object(m, "start_player", return_value=True) as start:
+            seen = m.notice_t3(set())
+            self.assertEqual(start.call_count, 0)
+            apps.return_value = {100}
+            seen = m.notice_t3(seen)
+            self.assertEqual(start.call_count, 1)
+            seen = m.notice_t3(seen)        # still open: a stopped player stays stopped
+            self.assertEqual(start.call_count, 1)
+            apps.return_value = set()
+            seen = m.notice_t3(seen)        # closed: nothing to do
+            self.assertEqual(start.call_count, 1)
+            apps.return_value = {100}       # opened again, even with the same process ID
+            seen = m.notice_t3(seen)
+            self.assertEqual(start.call_count, 2)
+            apps.return_value = {200}       # restarted between two looks
+            start.return_value = False      # a failed start is not retried in a loop
+            seen = m.notice_t3(seen)
+            self.assertEqual(start.call_count, 3)
+            m.notice_t3(seen)
+            self.assertEqual(start.call_count, 3)
+
+    def test_t3_code_is_recognized_after_its_process_id_was_another_programs(self):
+        names = {7: "notepad.exe"}
+        with patch.object(m, "exe_name", side_effect=names.get), \
+                patch.dict(m._t3_pids, clear=True), patch.object(m, "_t3_pids_until", 0.0):
+            self.assertFalse(m.is_t3_pid(7))
+            names[7] = "t3 code (beta).exe"
+            self.assertFalse(m.is_t3_pid(7))    # remembered for a few seconds
+            m._t3_pids_until = 0.0              # ... which have passed
+            self.assertTrue(m.is_t3_pid(7))
+
+    @unittest.skipUnless(os.name == "nt", "Windows events required")
+    def test_one_watcher_runs_at_a_time_and_stops_on_request(self):
+        with patch.object(m, "t3_apps", return_value={100}), \
+                patch.object(m, "start_player", return_value=True) as start:
+            first = threading.Thread(target=m.watch, args=(0.02,), daemon=True)
+            try:
+                self.assertFalse(m.watching())
+                first.start()
+                deadline = time.monotonic() + 5
+                while not m.watching() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(m.watching())
+                second = threading.Thread(target=m.watch, args=(0.02,), daemon=True)
+                second.start()
+                second.join(5)
+                self.assertFalse(second.is_alive())     # it left the work to the first
+                time.sleep(0.2)                         # several looks at the same T3 Code
+                self.assertTrue(first.is_alive())
+                self.assertEqual(start.call_count, 1)
+            finally:
+                stopped = m.stop_watching()
+                first.join(5)
+            self.assertTrue(stopped)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(m.watching())
+
+    @unittest.skipUnless(os.name == "nt", "Windows registry required")
+    def test_autostart_registers_the_watcher_with_windows_and_removes_it(self):
+        import winreg
+        parent = r"Software\T3 Music tests"
+        scratch = rf"{parent}\{os.getpid()}-{time.monotonic_ns()}"     # not the real Run key
+        python = self.root / "python.exe"
+        watcher = {"running": False}
+        try:
+            with patch.object(m, "AUTOSTART_KEY", scratch), \
+                    patch.object(sys, "executable", str(python)), \
+                    patch.object(m, "spawn",
+                                 side_effect=lambda command: watcher.update(running=True)) as spawn, \
+                    patch.object(m, "stop_watching",
+                                 side_effect=lambda: watcher.update(running=False) or True), \
+                    patch.object(m, "watching", side_effect=lambda: watcher["running"]):
+                self.assertEqual(m.autostart(), {
+                    "ok": True, "message": "autostart is off", "autostart": False,
+                    "watching": False, "command": None})
+                with self.assertRaises(ValueError):     # no windowless interpreter
+                    m.autostart("on")
+                self.assertIsNone(m.autostart_command())
+                python.with_name("pythonw.exe").touch()
+                on = m.autostart("on")
+                command = f'"{python.with_name("pythonw.exe")}" "{Path(m.__file__).resolve()}" watch'
+                self.assertEqual((on["ok"], on["autostart"], on["watching"], on["command"]),
+                                 (True, True, True, command))
+                spawn.assert_called_once_with("watch")
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, scratch) as key:
+                    self.assertEqual(winreg.QueryValueEx(key, m.THEME_NAME),
+                                     (command, winreg.REG_SZ))
+                self.assertTrue(m.autostart("on")["ok"])        # again: the watcher restarts
+                self.assertEqual(spawn.call_count, 2)
+                watcher["running"] = False      # e.g. ended in Task Manager
+                status = m.autostart("status")
+                self.assertEqual((status["ok"], status["autostart"], status["watching"]),
+                                 (True, True, False))
+                watcher["running"] = True
+                off = m.autostart("off")
+                self.assertEqual((off["ok"], off["autostart"], off["watching"], off["command"]),
+                                 (True, False, False, None))
+                self.assertTrue(m.autostart("off")["ok"])       # already off
+                with self.assertRaises(ValueError):
+                    m.autostart("sometimes")
+        finally:
+            for key in (scratch, parent):
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+                except OSError:
+                    pass
+
+
+def isolated_player(root):
+    """Environment and command line of a player apart from the installed one."""
+    env = {**os.environ, "T3_MUSIC_HOME": str(root),
+           "T3_MUSIC_USERDATA": str(root / "userdata"), "T3_MUSIC_HEADLESS": "1"}
+    (root / "t3music.state.json").write_text(
+        json.dumps({"volume": 0, "playlist": []}), "utf-8")
+    return env, [sys.executable, str(Path(m.__file__).resolve()), "--json"]
+
+
+def stop_isolated_player(case, root, env, command):
+    subprocess.run(command + ["stop"], env=env, capture_output=True,
+                   timeout=30, creationflags=m.NO_WINDOW)
+    deadline = time.monotonic() + 8
+    while (root / "t3music.port").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    case.assertFalse((root / "t3music.port").exists())
+    # The port disappears immediately before the process releases
+    # its lifetime lock; wait on that lock before temp cleanup.
+    import msvcrt
+    while (root / "t3music.lock").exists():
+        try:
+            with open(root / "t3music.lock", "r+b") as lock:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 @unittest.skipUnless(os.name == "nt", "Windows background process required")
 class BackgroundStartupTests(unittest.TestCase):
     def test_concurrent_pythonw_start_is_single_instance_and_stops_cleanly(self):
         with tempfile.TemporaryDirectory(prefix="t3-music-start-") as temp:
             root = Path(temp)
-            env = {**os.environ, "T3_MUSIC_HOME": str(root),
-                   "T3_MUSIC_USERDATA": str(root / "userdata"), "T3_MUSIC_HEADLESS": "1"}
-            (root / "t3music.state.json").write_text(
-                json.dumps({"volume": 0, "playlist": []}), "utf-8")
-            command = [sys.executable, str(Path(m.__file__).resolve()), "--json"]
+            env, command = isolated_player(root)
             processes = []
             try:
                 for _ in range(2):
@@ -349,24 +515,61 @@ class BackgroundStartupTests(unittest.TestCase):
                     if process.poll() is None:
                         process.terminate()
                         process.wait(timeout=5)
-                subprocess.run(command + ["stop"], env=env, capture_output=True,
-                               timeout=30, creationflags=m.NO_WINDOW)
-                deadline = time.monotonic() + 8
-                while (root / "t3music.port").exists() and time.monotonic() < deadline:
+                stop_isolated_player(self, root, env, command)
+
+    def test_sign_out_saves_state_and_stops_cleanly(self):
+        user32 = ctypes.WinDLL("user32")
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+
+        def session_window(pid):
+            name = ctypes.create_unicode_buffer(64)
+            for hwnd, owner, visible in m.top_windows():
+                if owner == pid and user32.GetClassNameW(hwnd, name, 64) \
+                        and name.value == m.SESSION_WINDOW:
+                    self.assertFalse(visible)
+                    return hwnd
+            return None
+
+        def send(hwnd, message, wparam):    # as Windows does: wait for the answer
+            answer = ctypes.c_size_t()
+            self.assertTrue(user32.SendMessageTimeoutW(
+                hwnd, message, wparam, 0, 0x0002, 10000, ctypes.byref(answer)))
+            return answer.value
+
+        with tempfile.TemporaryDirectory(prefix="t3-music-end-") as temp:
+            root = Path(temp)
+            env, command = isolated_player(root)
+
+            def run(*args):
+                done = subprocess.run(command + list(args), env=env, capture_output=True,
+                                      timeout=40, creationflags=m.NO_WINDOW)
+                self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace"))
+                return json.loads(done.stdout)
+
+            try:
+                pid = run("start")["pid"]
+                self.assertTrue(m.exe_name(pid).startswith("python"))
+                self.assertEqual(run("vol", "37")["volume"], 37)
+                deadline = time.monotonic() + 10
+                while not (hwnd := session_window(pid)) and time.monotonic() < deadline:
                     time.sleep(0.05)
+                self.assertTrue(hwnd, "the player has no window for session messages")
+                self.assertEqual(send(hwnd, 0x0011, 0), 1)      # WM_QUERYENDSESSION: go ahead
+                send(hwnd, m.WM_ENDSESSION, 1)
+                # Windows may end the process once it has the answer, so the
+                # player has to be done by now.
                 self.assertFalse((root / "t3music.port").exists())
-                # The port disappears immediately before the process releases
-                # its lifetime lock; wait on that lock before temp cleanup.
-                import msvcrt
-                while (root / "t3music.lock").exists():
-                    try:
-                        with open(root / "t3music.lock", "r+b") as lock:
-                            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError:
-                        if time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.05)
+                state = json.loads((root / "t3music.state.json").read_text("utf-8"))
+                self.assertEqual(state["volume"], 37)
+                log = (root / "t3music.log").read_text("utf-8").split("\n")
+                self.assertIn("session ending", log[-3])
+                self.assertIn("stopped", log[-2])
+                self.assertTrue(m.wait_for_exit(pid))
+            finally:
+                stop_isolated_player(self, root, env, command)
 
 
 if __name__ == "__main__":

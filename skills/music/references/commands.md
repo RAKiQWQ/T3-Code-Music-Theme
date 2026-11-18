@@ -24,6 +24,9 @@ paths and saved names are separate quoted arguments.
 | eq curve DB1 ... DB10 | Set all ten gains and enable EQ |
 | eq off / on | Bypass or re-enable EQ, preserving gains |
 | eq reset | Enable a flat curve |
+| autostart / autostart status | Report whether the player starts with T3 Code (autostart) and whether its watcher is running (watching) |
+| autostart on | Register the watcher for Windows sign-in and start it now; it starts the player at once if T3 Code is open |
+| autostart off | Remove the registration and stop the watcher; a running player keeps running |
 
 Bands are 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, and 16000 Hz.
 Gains must be finite and within -12 to +12 dB. Boosted curves apply automatic

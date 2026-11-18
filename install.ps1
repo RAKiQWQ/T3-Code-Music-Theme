@@ -1,7 +1,8 @@
 param(
     [string]$Python = 'python',
     [string]$Destination = (Join-Path $env:USERPROFILE '.t3\tools\t3-music'),
-    [switch]$SkipSkills
+    [switch]$SkipSkills,
+    [switch]$NoAutostart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,4 +83,16 @@ if (-not $SkipSkills) {
     Write-Output 'Installed /music for Codex and Claude.'
 }
 Write-Output "Installed player: $destinationPath"
-Write-Output "Select 'T3 Music' in T3 Code, then run: & '$destinationPath\music.ps1' start"
+$startHint = "& '$destinationPath\music.ps1' start"
+if ($NoAutostart) {
+    Write-Output "Select 'T3 Music' in T3 Code, then run: $startHint"
+} else {
+    # Registers the watcher for Windows sign-in and (re)starts it with the
+    # installed code. With T3 Code open, it brings the player back right away.
+    & $musicPython $installedPlayer autostart on
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "Select 'T3 Music' in T3 Code. The player starts with T3 Code; to start it by hand: $startHint"
+    } else {
+        Write-Warning "Autostart was not turned on. Select 'T3 Music' in T3 Code, then run: $startHint"
+    }
+}
